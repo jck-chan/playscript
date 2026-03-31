@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "playscript-pressor"
+version = "0.1.0"
+description = "Automatic Instrument Player / Key Presser"
+requires-python = ">=3.9"
+dependencies = [
+  "keyboard",
+  "pydantic",
+]
+
