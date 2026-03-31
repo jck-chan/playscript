@@ -46,14 +46,14 @@ KEYS = KeyMapConfig(
 ).notes
 
 # str of key name separated by spaces or line breaks.
-# Inline speed: ``<x2>`` ``<x0.5>`` — effective beat = single_beat_seconds / factor.
-# Parallel voices: ``<p> voice0 / voice1 </p>`` — one column per beat, ``/`` separates parts.
-# Lines starting with ``/`` are ignored (visual separators only).
+# Speed regions: ``<x2> ... </x>`` — only wrapped notes use that factor.
+# Parallel threads in ``<p>``: separate with ``|`` (outside ``<x>…</x>``). Each voice keeps its own tempo;
+# threads start together then run independently (polyrhythm-friendly).
 with open("./sheets/canon.txt", "rt") as f:
     text_sheet: str = f.read()
 
 # Total length of one beat (seconds), before speed scaling.
-single_beat_seconds = 0.5
+single_beat_seconds = 0.35
 
 # Release the physical key this many seconds *before* the beat ends (staccato gap).
 # Scaled by speed like the beat (shorter beats → proportionally shorter early release).
@@ -80,69 +80,125 @@ class SheetTieStep:
 
 
 @dataclass(frozen=True)
-class SheetSpeedMul:
-    """Playback speed multiplier: effective beat = single_beat_seconds / factor."""
+class SheetTimedStep:
+    """One key or tie beat with its own speed (from ``<xN>…</x>`` scope)."""
 
-    factor: float
+    speed_mul: float
+    step: SheetKeyStep | SheetTieStep
 
 
 @dataclass(frozen=True)
 class SheetParallel:
-    """Several melodies played together; ``voices`` share each hold column (beat)."""
+    """Several melodies played together; each voice runs on its own clock (``<p>`` threads)."""
 
-    voices: tuple[tuple["SheetItem", ...], ...]
+    voices: tuple[tuple[SheetTimedStep, ...], ...]
 
 
-SheetItem = SheetKeyStep | SheetTieStep | SheetSpeedMul | SheetParallel
+SheetItem = SheetTimedStep | SheetParallel
 
-# Keys currently sent as pressed to the OS (serial + parallel).
-_physically_down: set[str] = set()
+# Refcount so parallel voices can share a physical key without one releasing the other's hold.
+_key_press_refcount: dict[str, int] = {}
+_keyboard_lock = threading.Lock()
 
 
 def _keyboard_press_key(key: str) -> None:
-    if key not in _physically_down:
-        keyboard.press(key)
-        _physically_down.add(key)
+    with _keyboard_lock:
+        _key_press_refcount[key] = _key_press_refcount.get(key, 0) + 1
+        if _key_press_refcount[key] == 1:
+            keyboard.press(key)
 
 
 def _keyboard_release_key(key: str) -> None:
-    if key in _physically_down:
-        keyboard.release(key)
-        _physically_down.discard(key)
+    with _keyboard_lock:
+        n = _key_press_refcount.get(key, 0)
+        if n <= 0:
+            return
+        _key_press_refcount[key] = n - 1
+        if _key_press_refcount[key] == 0:
+            del _key_press_refcount[key]
+            keyboard.release(key)
 
 
 def release_all_keys() -> None:
-    for k in list(_physically_down):
-        _keyboard_release_key(k)
+    with _keyboard_lock:
+        for k in list(_key_press_refcount.keys()):
+            keyboard.release(k)
+        _key_press_refcount.clear()
 
 
-_SPEED_TAG_RE = re.compile(
-    r"^<x\s*([0-9]+\.?[0-9]*|[0-9]*\.[0-9]+)\s*>$",
+_X_OPEN_RE = re.compile(
+    r"<x\s*([0-9]+\.?[0-9]*|[0-9]*\.[0-9]+)\s*>",
     re.IGNORECASE,
 )
+_X_CLOSE_RE = re.compile(r"</x\s*>", re.IGNORECASE)
 _P_BLOCK_RE = re.compile(r"<p\s*>(.*?)</p\s*>", re.IGNORECASE | re.DOTALL)
 
 
-def _parse_speed_tag(token: str) -> SheetSpeedMul | None:
-    m = _SPEED_TAG_RE.match(token.strip())
-    if not m:
-        return None
-    factor = float(m.group(1))
-    if factor <= 0:
-        raise ValueError(f"Speed factor in {token!r} must be positive")
-    return SheetSpeedMul(factor=factor)
+def _split_parallel_voice_segments(s: str) -> list[str]:
+    """Split on ``|`` only outside ``<xN>…</x>``."""
+    parts: list[str] = []
+    cur: list[str] = []
+    i = 0
+    n = len(s)
+    depth_x = 0
+    while i < n:
+        if depth_x == 0 and s[i] == "|":
+            seg = "".join(cur).strip()
+            if seg:
+                parts.append(seg)
+            cur = []
+            i += 1
+            while i < n and s[i] == " ":
+                i += 1
+            continue
+        mo = _X_OPEN_RE.match(s, i)
+        if mo is not None:
+            cur.append(s[i : mo.end()])
+            depth_x += 1
+            i = mo.end()
+            continue
+        mc = _X_CLOSE_RE.match(s, i)
+        if mc is not None:
+            cur.append(s[i : mc.end()])
+            depth_x -= 1
+            i = mc.end()
+            continue
+        cur.append(s[i])
+        i += 1
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts
 
 
-def _parse_tokens_to_steps(
+def _find_matching_x_close(s: str, inner_start: int) -> tuple[int, int]:
+    """Return ``(index_of_close_tag, index_after_close)`` for the first ``</x>`` matching opens."""
+    depth = 1
+    i = inner_start
+    while depth > 0:
+        mo = _X_OPEN_RE.search(s, i)
+        mc = _X_CLOSE_RE.search(s, i)
+        if mc is None:
+            raise ValueError("Unclosed <xN>… region (missing </x>)")
+        if mo is not None and mo.start() < mc.start():
+            depth += 1
+            i = mo.end()
+        else:
+            depth -= 1
+            if depth == 0:
+                return (mc.start(), mc.end())
+            i = mc.end()
+    raise RuntimeError("unreachable")
+
+
+def _tokens_to_key_tie_steps(
     tokens: list[str],
     name_to_index: dict[str, int],
     tie_char: str,
-) -> list[SheetItem]:
-    steps: list[SheetItem] = []
+) -> list[SheetKeyStep | SheetTieStep]:
+    steps: list[SheetKeyStep | SheetTieStep] = []
     for token in tokens:
-        sm = _parse_speed_tag(token)
-        if sm is not None:
-            steps.append(sm)
+        if token == "|":
             continue
         if _is_tie_run(token, tie_char):
             steps.extend(SheetTieStep() for _ in range(len(token)))
@@ -154,20 +210,62 @@ def _parse_tokens_to_steps(
     return steps
 
 
+def _plain_text_to_timed_steps(
+    text: str,
+    speed_mul: float,
+    name_to_index: dict[str, int],
+    tie_char: str,
+) -> list[SheetTimedStep]:
+    out: list[SheetTimedStep] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        for st in _tokens_to_key_tie_steps(line.split(), name_to_index, tie_char):
+            out.append(SheetTimedStep(speed_mul=speed_mul, step=st))
+    return out
+
+
+def _parse_timed_string(
+    s: str,
+    speed_mul: float,
+    name_to_index: dict[str, int],
+    tie_char: str,
+) -> list[SheetTimedStep]:
+    """Parse notes/ties and nested ``<xN>inner</x>``; ``speed_mul`` applies outside inner regions."""
+    result: list[SheetTimedStep] = []
+    pos = 0
+    n = len(s)
+    while pos < n:
+        m = _X_OPEN_RE.search(s, pos)
+        if m is None:
+            result.extend(_plain_text_to_timed_steps(s[pos:], speed_mul, name_to_index, tie_char))
+            break
+        if m.start() > pos:
+            result.extend(
+                _plain_text_to_timed_steps(
+                    s[pos : m.start()], speed_mul, name_to_index, tie_char
+                )
+            )
+        factor = float(m.group(1))
+        if factor <= 0:
+            raise ValueError(f"Speed factor in {m.group(0)!r} must be positive")
+        inner_start = m.end()
+        close_start, after_close = _find_matching_x_close(s, inner_start)
+        inner = s[inner_start:close_start]
+        result.extend(
+            _parse_timed_string(inner, factor, name_to_index, tie_char)
+        )
+        pos = after_close
+    return result
+
+
 def _parse_plain_sheet_chunk(
     chunk: str,
     name_to_index: dict[str, int],
     tie_char: str,
-) -> list[SheetItem]:
-    steps: list[SheetItem] = []
-    for raw_line in chunk.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("/"):
-            continue
-        steps.extend(_parse_tokens_to_steps(line.split(), name_to_index, tie_char))
-    return steps
+) -> list[SheetTimedStep]:
+    return _parse_timed_string(chunk, 1.0, name_to_index, tie_char)
 
 
 def _parse_parallel_inner(
@@ -176,19 +274,19 @@ def _parse_parallel_inner(
     tie_char: str,
 ) -> SheetParallel:
     normalized = " ".join(inner.split())
-    parts = [p.strip() for p in normalized.split("/") if p.strip()]
+    parts = [p.strip() for p in _split_parallel_voice_segments(normalized) if p.strip()]
     if not parts:
         raise ValueError(
             "<p> block must contain at least one voice (non-empty segment)."
         )
-    voices: list[tuple[SheetItem, ...]] = []
+    voices: list[tuple[SheetTimedStep, ...]] = []
     for p in parts:
-        voices.append(tuple(_parse_tokens_to_steps(p.split(), name_to_index, tie_char)))
+        voices.append(tuple(_parse_timed_string(p, 1.0, name_to_index, tie_char)))
     return SheetParallel(voices=tuple(voices))
 
 
 def _parse_sheet(text: str, keys: list[Note], tie_char: str) -> list[SheetItem]:
-    """Parse sheet: ``<p>…</p>`` parallel blocks, ``<xN>`` tags, notes."""
+    """Parse sheet: ``<p>…</p>`` parallel blocks, ``<xN>…</x>`` speed regions, notes."""
     if len(tie_char) != 1:
         raise ValueError("tie_char must be exactly one character (set TIE_CHAR).")
     name_to_index = {k.name: i for i, k in enumerate(keys)}
@@ -303,125 +401,113 @@ def _beat_press_and_tail(hold_sec: float, speed_mul: float) -> tuple[float, floa
     return press_part, tail
 
 
-def _play_parallel(
-    voices: tuple[tuple[SheetItem, ...], ...],
-    speed_mul: float,
-) -> float:
-    """Play aligned columns: each voice advances one step per column, same hold for all."""
-    V = len(voices)
-    max_len = max((len(voices[v]) for v in range(V)), default=0)
-    voice_held: list[str | None] = [None] * V
+def _play_parallel_voice_line(steps: tuple[SheetTimedStep, ...]) -> None:
+    """Play one ``<p>`` thread with its own ``speed_mul`` per step (same rules as serial)."""
+    vc_current: str | None = None
 
-    def other_holds_key(key: str, except_v: int) -> bool:
-        for w, hk in enumerate(voice_held):
-            if w != except_v and hk == key:
-                return True
-        return False
-
-    def release_voice(v: int) -> None:
-        k = voice_held[v]
-        if k is None:
+    def v_release_current_if_any() -> None:
+        nonlocal vc_current
+        if vc_current is None:
             return
-        voice_held[v] = None
-        if not other_holds_key(k, v):
-            _keyboard_release_key(k)
+        _keyboard_release_key(vc_current)
+        vc_current = None
 
-    def voice_holds_key_full_column(v: int, col: int) -> bool:
-        it = voices[v][col]
-        if isinstance(it, SheetSpeedMul):
-            return False
-        nxt = voices[v][col + 1] if col + 1 < len(voices[v]) else None
-        if isinstance(it, SheetTieStep):
-            return nxt is not None and isinstance(nxt, SheetTieStep)
-        if isinstance(it, SheetKeyStep):
-            ki = KEYS[it.key_index]
-            return (
-                ki.key is not None and nxt is not None and isinstance(nxt, SheetTieStep)
-            )
-        return False
+    def v_press_and_hold(key: str) -> None:
+        nonlocal vc_current
+        if vc_current is not None and vc_current != key:
+            _keyboard_release_key(vc_current)
+        vc_current = key
+        _keyboard_press_key(key)
 
-    def voice_should_release_at_column_boundary(v: int, col: int) -> bool:
-        it = voices[v][col]
-        if isinstance(it, SheetSpeedMul):
-            return False
-        nxt = voices[v][col + 1] if col + 1 < len(voices[v]) else None
-        if isinstance(it, SheetTieStep):
-            return nxt is None or not isinstance(nxt, SheetTieStep)
-        assert isinstance(it, SheetKeyStep)
-        ki = KEYS[it.key_index]
-        if ki.key is not None and nxt is not None and isinstance(nxt, SheetTieStep):
-            return False
-        return True
-
-    for col in range(max_len):
+    for i, item in enumerate(steps):
         if pause_event.is_set() or shutdown_event.is_set():
             break
-
-        for v in range(V):
-            if col < len(voices[v]):
-                it = voices[v][col]
-                if isinstance(it, SheetSpeedMul):
-                    speed_mul = it.factor
-
+        speed_mul = item.speed_mul
         hold_sec = _effective_hold_seconds(speed_mul)
         press_part, tail = _beat_press_and_tail(hold_sec, speed_mul)
+        nxt = steps[i + 1] if i + 1 < len(steps) else None
+        nxt_tie = nxt is not None and isinstance(nxt.step, SheetTieStep)
 
-        for v in range(V):
-            if col >= len(voices[v]):
-                continue
-            it = voices[v][col]
-            if isinstance(it, SheetSpeedMul):
-                continue
-            if isinstance(it, SheetTieStep):
-                continue
-            if isinstance(it, SheetKeyStep):
-                ki = KEYS[it.key_index]
-                if ki.key is not None:
-                    if voice_held[v] is not None and voice_held[v] != ki.key:
-                        release_voice(v)
-                    voice_held[v] = ki.key
-                    _keyboard_press_key(ki.key)
-                else:
-                    release_voice(v)
+        if isinstance(item.step, SheetTieStep):
+            if nxt_tie:
+                if not wait_or_pause(hold_sec):
+                    break
+            else:
+                if not wait_or_pause(press_part):
+                    break
+                v_release_current_if_any()
+                if tail > 0 and not wait_or_pause(tail):
+                    break
+            continue
 
-        if not wait_or_pause(press_part):
-            break
+        idx = item.step.key_index
+        ki = KEYS[idx]
+        if ki.key is not None:
+            v_press_and_hold(ki.key)
+        else:
+            v_release_current_if_any()
 
-        for v in range(V):
-            if col >= len(voices[v]):
-                continue
-            it = voices[v][col]
-            if isinstance(it, SheetSpeedMul):
-                continue
-            if voice_holds_key_full_column(v, col):
-                continue
-            if voice_should_release_at_column_boundary(v, col):
-                release_voice(v)
+        continues_into_tie = ki.key is not None and nxt_tie
+        if continues_into_tie:
+            if not wait_or_pause(hold_sec):
+                break
+        else:
+            if not wait_or_pause(press_part):
+                break
+            v_release_current_if_any()
+            if tail > 0 and not wait_or_pause(tail):
+                break
+    v_release_current_if_any()
 
-        if tail > 0 and not wait_or_pause(tail):
-            break
 
-    for v in range(V):
-        release_voice(v)
-    return speed_mul
+def _play_parallel(
+    voices: tuple[tuple[SheetTimedStep, ...], ...],
+) -> None:
+    """Each voice in its own thread; barrier aligns beat 0 then clocks diverge."""
+    V = len(voices)
+    if V == 0:
+        return
+    if V == 1:
+        _play_parallel_voice_line(voices[0])
+        return
+    barrier = threading.Barrier(V)
+
+    def run_voice(steps: tuple[SheetTimedStep, ...]) -> None:
+        barrier.wait()
+        _play_parallel_voice_line(steps)
+
+    threads = [
+        threading.Thread(target=run_voice, args=(voices[v],)) for v in range(V)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 def main() -> None:
-    n_keys = sum(1 for x in sheet_steps if isinstance(x, SheetKeyStep))
-    n_ties = sum(1 for x in sheet_steps if isinstance(x, SheetTieStep))
-    n_cmds = sum(1 for x in sheet_steps if isinstance(x, SheetSpeedMul))
+    n_keys = sum(
+        1
+        for x in sheet_steps
+        if isinstance(x, SheetTimedStep) and isinstance(x.step, SheetKeyStep)
+    )
+    n_ties = sum(
+        1
+        for x in sheet_steps
+        if isinstance(x, SheetTimedStep) and isinstance(x.step, SheetTieStep)
+    )
     n_par = sum(1 for x in sheet_steps if isinstance(x, SheetParallel))
     print("Auto key hold tapper ready (start hotkey toggles pause/resume).")
     print(
         f"Sheet: {len(sheet_steps)} top-level items ({n_keys} notes, {n_ties} ties, "
-        f"{n_cmds} speed steps, {n_par} <p> blocks)"
+        f"{n_par} <p> blocks)"
     )
     print(
         f"Tie character in sheet: {TIE_CHAR!r} (runs like {TIE_CHAR * 3} = 3 tie steps)"
     )
     print(f"Key definitions: {KEYS}")
     print(
-        f"Beat: {single_beat_seconds}s (÷N via <xN>); "
+        f"Beat: {single_beat_seconds}s (÷N inside <xN>…</x>); "
         f"release {release_before_beat_end}s before beat end (scaled)"
     )
     print(f"Start hotkey: {START_HOTKEY}")
@@ -444,36 +530,32 @@ def main() -> None:
                 time.sleep(0.05)
                 continue
 
-            speed_mul = 1.0
             for i, item in enumerate(sheet_steps):
                 step = i + 1
                 if pause_event.is_set() or shutdown_event.is_set():
                     break
 
-                if isinstance(item, SheetSpeedMul):
-                    speed_mul = item.factor
-                    h = _effective_hold_seconds(speed_mul)
-                    print(
-                        f"[{step}] speed x{speed_mul} -> hold={h}s (base/{speed_mul})"
-                    )
-                    continue
-
                 if isinstance(item, SheetParallel):
-                    cols = max((len(v) for v in item.voices), default=0)
+                    lens = [len(v) for v in item.voices]
                     print(
-                        f"[{step}] <p> parallel: {len(item.voices)} voices, {cols} columns"
+                        f"[{step}] <p> parallel: {len(item.voices)} voices (steps each: {lens})"
                     )
-                    speed_mul = _play_parallel(item.voices, speed_mul)
+                    _play_parallel(item.voices)
                     continue
 
+                assert isinstance(item, SheetTimedStep)
+                speed_mul = item.speed_mul
                 hold_sec = _effective_hold_seconds(speed_mul)
                 press_part, tail = _beat_press_and_tail(hold_sec, speed_mul)
                 nxt = _next_item_after(i)
+                nxt_tie = (
+                    isinstance(nxt, SheetTimedStep) and isinstance(nxt.step, SheetTieStep)
+                )
 
-                if isinstance(item, SheetTieStep):
+                if isinstance(item.step, SheetTieStep):
                     # Tie: extend previous key for one beat; early release only when tie ends.
                     print(f"[{step}] -")
-                    tie_continues = nxt is not None and isinstance(nxt, SheetTieStep)
+                    tie_continues = nxt_tie
                     if tie_continues:
                         if not wait_or_pause(hold_sec):
                             break
@@ -485,7 +567,7 @@ def main() -> None:
                             break
                     continue
 
-                idx = item.key_index
+                idx = item.step.key_index
                 ki = KEYS[idx]
                 print(
                     f"[{step}] {ki.name}  ({ki.key})"
@@ -498,9 +580,7 @@ def main() -> None:
                     # Rest (e.g. name ";") — nothing held for this step.
                     release_current_if_any()
 
-                continues_into_tie = ki.key is not None and isinstance(
-                    nxt, SheetTieStep
-                )
+                continues_into_tie = ki.key is not None and nxt_tie
                 if continues_into_tie:
                     if not wait_or_pause(hold_sec):
                         break
@@ -510,6 +590,13 @@ def main() -> None:
                     release_current_if_any()
                     if tail > 0 and not wait_or_pause(tail):
                         break
+            else:
+                # Entire sheet played without ``break`` (no pause/shutdown mid-item).
+                print("\nEnd of sheet.")
+                break
+
+            if shutdown_event.is_set():
+                break
     except KeyboardInterrupt:
         shutdown_event.set()
     finally:
