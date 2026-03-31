@@ -47,8 +47,8 @@ KEYS = KeyMapConfig(
 
 # str of key name separated by spaces or line breaks.
 # Speed regions: ``<x2> ... </x>`` — only wrapped notes use that factor.
-# Parallel threads in ``<p>``: separate with ``|`` (outside ``<x>…</x>``). Each voice keeps its own tempo;
-# threads start together then run independently (polyrhythm-friendly).
+# Parallel voices in ``<p>``: separate with ``|`` (outside ``<x>…</x>``). Playback uses a merged time schedule:
+# each voice is simulated like serial (own ``speed_mul`` per step), events get absolute times, then sorted and played.
 with open("./sheets/canon.txt", "rt") as f:
     text_sheet: str = f.read()
 
@@ -89,7 +89,7 @@ class SheetTimedStep:
 
 @dataclass(frozen=True)
 class SheetParallel:
-    """Several melodies played together; each voice runs on its own clock (``<p>`` threads)."""
+    """Several melodies in ``<p>``; each voice has its own timeline, merged by wall-clock."""
 
     voices: tuple[tuple[SheetTimedStep, ...], ...]
 
@@ -401,27 +401,27 @@ def _beat_press_and_tail(hold_sec: float, speed_mul: float) -> tuple[float, floa
     return press_part, tail
 
 
-def _play_parallel_voice_line(steps: tuple[SheetTimedStep, ...]) -> None:
-    """Play one ``<p>`` thread with its own ``speed_mul`` per step (same rules as serial)."""
-    vc_current: str | None = None
+# (absolute_time_s, sort_prio, voice_idx, physical_key, "press"|"release")
+# sort_prio: release before press at same timestamp; then voice_idx for stability.
+_SchedEvent = tuple[float, int, int, str, Literal["press", "release"]]
 
-    def v_release_current_if_any() -> None:
-        nonlocal vc_current
-        if vc_current is None:
-            return
-        _keyboard_release_key(vc_current)
-        vc_current = None
 
-    def v_press_and_hold(key: str) -> None:
-        nonlocal vc_current
-        if vc_current is not None and vc_current != key:
-            _keyboard_release_key(vc_current)
-        vc_current = key
-        _keyboard_press_key(key)
+def _schedule_voice_events(
+    steps: tuple[SheetTimedStep, ...],
+    voice_idx: int,
+) -> list[_SchedEvent]:
+    """Build press/release events with wall times (same rules as the serial player for one line)."""
+    out: list[_SchedEvent] = []
+    t = 0.0
+    vc_held: str | None = None
+
+    def emit_release(at: float, key: str) -> None:
+        out.append((at, 0, voice_idx, key, "release"))
+
+    def emit_press(at: float, key: str) -> None:
+        out.append((at, 1, voice_idx, key, "press"))
 
     for i, item in enumerate(steps):
-        if pause_event.is_set() or shutdown_event.is_set():
-            break
         speed_mul = item.speed_mul
         hold_sec = _effective_hold_seconds(speed_mul)
         press_part, tail = _beat_press_and_tail(hold_sec, speed_mul)
@@ -430,59 +430,64 @@ def _play_parallel_voice_line(steps: tuple[SheetTimedStep, ...]) -> None:
 
         if isinstance(item.step, SheetTieStep):
             if nxt_tie:
-                if not wait_or_pause(hold_sec):
-                    break
+                t += hold_sec
             else:
-                if not wait_or_pause(press_part):
-                    break
-                v_release_current_if_any()
-                if tail > 0 and not wait_or_pause(tail):
-                    break
+                if vc_held is not None:
+                    emit_release(t + press_part, vc_held)
+                    vc_held = None
+                t += hold_sec
             continue
 
-        idx = item.step.key_index
-        ki = KEYS[idx]
-        if ki.key is not None:
-            v_press_and_hold(ki.key)
-        else:
-            v_release_current_if_any()
+        assert isinstance(item.step, SheetKeyStep)
+        ki = KEYS[item.step.key_index]
+        if ki.key is None:
+            if vc_held is not None:
+                emit_release(t, vc_held)
+                vc_held = None
+            t += hold_sec
+            continue
 
-        continues_into_tie = ki.key is not None and nxt_tie
+        if vc_held is not None and vc_held != ki.key:
+            emit_release(t, vc_held)
+            vc_held = None
+        vc_held = ki.key
+        emit_press(t, ki.key)
+
+        continues_into_tie = nxt_tie
         if continues_into_tie:
-            if not wait_or_pause(hold_sec):
-                break
+            t += hold_sec
         else:
-            if not wait_or_pause(press_part):
-                break
-            v_release_current_if_any()
-            if tail > 0 and not wait_or_pause(tail):
-                break
-    v_release_current_if_any()
+            emit_release(t + press_part, ki.key)
+            vc_held = None
+            t += hold_sec
+
+    if vc_held is not None:
+        emit_release(t, vc_held)
+
+    return out
 
 
 def _play_parallel(
     voices: tuple[tuple[SheetTimedStep, ...], ...],
 ) -> None:
-    """Each voice in its own thread; barrier aligns beat 0 then clocks diverge."""
-    V = len(voices)
-    if V == 0:
-        return
-    if V == 1:
-        _play_parallel_voice_line(voices[0])
-        return
-    barrier = threading.Barrier(V)
+    """Merge precomputed per-voice schedules and play by absolute time (not column-locked)."""
+    merged: list[_SchedEvent] = []
+    for v, steps in enumerate(voices):
+        merged.extend(_schedule_voice_events(steps, v))
+    merged.sort(key=lambda e: (e[0], e[1], e[2]))
 
-    def run_voice(steps: tuple[SheetTimedStep, ...]) -> None:
-        barrier.wait()
-        _play_parallel_voice_line(steps)
-
-    threads = [
-        threading.Thread(target=run_voice, args=(voices[v],)) for v in range(V)
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    t_play = 0.0
+    for t_abs, _prio, _vidx, key, kind in merged:
+        if pause_event.is_set() or shutdown_event.is_set():
+            return
+        dt = t_abs - t_play
+        if dt > 0 and not wait_or_pause(dt):
+            return
+        t_play = t_abs
+        if kind == "press":
+            _keyboard_press_key(key)
+        else:
+            _keyboard_release_key(key)
 
 
 def main() -> None:
@@ -538,7 +543,7 @@ def main() -> None:
                 if isinstance(item, SheetParallel):
                     lens = [len(v) for v in item.voices]
                     print(
-                        f"[{step}] <p> parallel: {len(item.voices)} voices (steps each: {lens})"
+                        f"[{step}] <p> parallel: {len(item.voices)} voices, steps {lens} (time-merged)"
                     )
                     _play_parallel(item.voices)
                     continue
@@ -592,8 +597,10 @@ def main() -> None:
                         break
             else:
                 # Entire sheet played without ``break`` (no pause/shutdown mid-item).
-                print("\nEnd of sheet.")
-                break
+                print(
+                    "\nEnd of sheet. Paused — press start hotkey to play again."
+                )
+                pause_event.set()
 
             if shutdown_event.is_set():
                 break
