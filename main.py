@@ -2,47 +2,53 @@ import re
 import time
 import threading
 from dataclasses import dataclass
-
+from typing import Literal
 import keyboard
 from pydantic import BaseModel
 
 
-class KeyInfo(BaseModel):
+class Note(BaseModel):
     name: str
     key: str | None
-    notes: str = ""
+    remarks: str = ""
 
+
+class KeyMapConfig(BaseModel):
+    """Ordered physical key slots for the sheet (validated as a unit)."""
+
+    type: Literal["key_map"] = "key_map"
+    notes: list[Note]
 
 # One character: a run of only this in the sheet ties / extends the previous held key
 # (e.g. "-" -> one step, "---" -> three steps). Must not match any ``KeyInfo.name``.
 TIE_CHAR = "-"
 
 # Keys you want to cycle through (in order)
-KEYS = [
-    KeyInfo(name=";", key=None),
-    KeyInfo(name="1.", key="y"),
-    KeyInfo(name="2.", key="u"),
-    KeyInfo(name="3.", key="i"),
-    KeyInfo(name="4.", key="o"),
-    KeyInfo(name="5.", key="p"),
-    KeyInfo(name="6.", key="h"),
-    KeyInfo(name="7.", key="j"),
-    KeyInfo(name="1", key="k"),
-    KeyInfo(name="2", key="l"),
-    KeyInfo(name="3", key=";"),
-    KeyInfo(name="4", key="n"),
-    KeyInfo(name="5", key="m"),
-    KeyInfo(name="6", key=","),
-    KeyInfo(name="7", key="."),
-    KeyInfo(name="1'", key="/"),
-]
+KEYS = KeyMapConfig(
+    notes=[
+        Note(name=";", key=None),
+        Note(name="1.", key="y"),
+        Note(name="2.", key="u"),
+        Note(name="3.", key="i"),
+        Note(name="4.", key="o"),
+        Note(name="5.", key="p"),
+        Note(name="6.", key="h"),
+        Note(name="7.", key="j"),
+        Note(name="1", key="k"),
+        Note(name="2", key="l"),
+        Note(name="3", key=";"),
+        Note(name="4", key="n"),
+        Note(name="5", key="m"),
+        Note(name="6", key=","),
+        Note(name="7", key="."),
+        Note(name="1'", key="/"),
+    ]
+).notes
 
 # str of key name separated by spaces or line breaks.
-# A line whose first non-space character is ``/`` is a command (not notes), e.g.:
-#   /speed_mul 4
-# meaning beat length is single_beat_seconds/4 — four times faster.
-# Inline speed: ``<x2>`` ``<x0.5>`` (same as /speed_mul).
+# Inline speed: ``<x2>`` ``<x0.5>`` — effective beat = single_beat_seconds / factor.
 # Parallel voices: ``<p> voice0 / voice1 </p>`` — one column per beat, ``/`` separates parts.
+# Lines starting with ``/`` are ignored (visual separators only).
 with open("./sheets/canon.txt", "rt") as f:
     text_sheet: str = f.read()
 
@@ -117,26 +123,6 @@ _SPEED_TAG_RE = re.compile(
 _P_BLOCK_RE = re.compile(r"<p\s*>(.*?)</p\s*>", re.IGNORECASE | re.DOTALL)
 
 
-def _parse_command_line(line: str) -> SheetSpeedMul | None:
-    """
-    ``line`` is stripped and starts with ``/``.
-    Returns a sheet item, or None for an empty no-op command line.
-    """
-    body = line[1:].strip()
-    if not body:
-        return None
-    parts = body.split()
-    cmd = parts[0].lower()
-    if cmd == "speed_mul":
-        if len(parts) < 2:
-            raise ValueError("/speed_mul requires a number, e.g. /speed_mul 4")
-        factor = float(parts[1])
-        if factor <= 0:
-            raise ValueError("/speed_mul value must be positive")
-        return SheetSpeedMul(factor=factor)
-    raise ValueError(f"Unknown sheet command /{cmd}. Known: speed_mul")
-
-
 def _parse_speed_tag(token: str) -> SheetSpeedMul | None:
     m = _SPEED_TAG_RE.match(token.strip())
     if not m:
@@ -179,9 +165,6 @@ def _parse_plain_sheet_chunk(
         if not line:
             continue
         if line.startswith("/"):
-            cmd_item = _parse_command_line(line)
-            if cmd_item is not None:
-                steps.append(cmd_item)
             continue
         steps.extend(_parse_tokens_to_steps(line.split(), name_to_index, tie_char))
     return steps
@@ -195,15 +178,17 @@ def _parse_parallel_inner(
     normalized = " ".join(inner.split())
     parts = [p.strip() for p in normalized.split("/") if p.strip()]
     if not parts:
-        raise ValueError("<p> block must contain at least one voice (non-empty segment).")
+        raise ValueError(
+            "<p> block must contain at least one voice (non-empty segment)."
+        )
     voices: list[tuple[SheetItem, ...]] = []
     for p in parts:
         voices.append(tuple(_parse_tokens_to_steps(p.split(), name_to_index, tie_char)))
     return SheetParallel(voices=tuple(voices))
 
 
-def _parse_sheet(text: str, keys: list[KeyInfo], tie_char: str) -> list[SheetItem]:
-    """Parse sheet: ``<p>…</p>`` parallel blocks, ``<xN>`` tags, ``/`` commands, notes."""
+def _parse_sheet(text: str, keys: list[Note], tie_char: str) -> list[SheetItem]:
+    """Parse sheet: ``<p>…</p>`` parallel blocks, ``<xN>`` tags, notes."""
     if len(tie_char) != 1:
         raise ValueError("tie_char must be exactly one character (set TIE_CHAR).")
     name_to_index = {k.name: i for i, k in enumerate(keys)}
@@ -216,7 +201,9 @@ def _parse_sheet(text: str, keys: list[KeyInfo], tie_char: str) -> list[SheetIte
     pos = 0
     for m in _P_BLOCK_RE.finditer(text):
         if m.start() > pos:
-            steps.extend(_parse_plain_sheet_chunk(text[pos : m.start()], name_to_index, tie_char))
+            steps.extend(
+                _parse_plain_sheet_chunk(text[pos : m.start()], name_to_index, tie_char)
+            )
         steps.append(_parse_parallel_inner(m.group(1), name_to_index, tie_char))
         pos = m.end()
     if pos < len(text):
@@ -348,7 +335,9 @@ def _play_parallel(
             return nxt is not None and isinstance(nxt, SheetTieStep)
         if isinstance(it, SheetKeyStep):
             ki = KEYS[it.key_index]
-            return ki.key is not None and nxt is not None and isinstance(nxt, SheetTieStep)
+            return (
+                ki.key is not None and nxt is not None and isinstance(nxt, SheetTieStep)
+            )
         return False
 
     def voice_should_release_at_column_boundary(v: int, col: int) -> bool:
@@ -432,7 +421,7 @@ def main() -> None:
     )
     print(f"Key definitions: {KEYS}")
     print(
-        f"Beat: {single_beat_seconds}s (÷N via /speed_mul or <xN>); "
+        f"Beat: {single_beat_seconds}s (÷N via <xN>); "
         f"release {release_before_beat_end}s before beat end (scaled)"
     )
     print(f"Start hotkey: {START_HOTKEY}")
@@ -464,12 +453,16 @@ def main() -> None:
                 if isinstance(item, SheetSpeedMul):
                     speed_mul = item.factor
                     h = _effective_hold_seconds(speed_mul)
-                    print(f"[{step}] speed x{speed_mul} -> hold={h}s (base/{speed_mul})")
+                    print(
+                        f"[{step}] speed x{speed_mul} -> hold={h}s (base/{speed_mul})"
+                    )
                     continue
 
                 if isinstance(item, SheetParallel):
                     cols = max((len(v) for v in item.voices), default=0)
-                    print(f"[{step}] <p> parallel: {len(item.voices)} voices, {cols} columns")
+                    print(
+                        f"[{step}] <p> parallel: {len(item.voices)} voices, {cols} columns"
+                    )
                     speed_mul = _play_parallel(item.voices, speed_mul)
                     continue
 
@@ -496,7 +489,7 @@ def main() -> None:
                 ki = KEYS[idx]
                 print(
                     f"[{step}] {ki.name}  ({ki.key})"
-                    f"{" # " + ki.notes if ki.notes else ""}"
+                    f"{" # " + ki.remarks if ki.remarks else ""}"
                 )
 
                 if ki.key is not None:
