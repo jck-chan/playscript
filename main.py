@@ -1,11 +1,16 @@
+print("importing modules...")
 import re
 import time
 import threading
 from dataclasses import dataclass
 from typing import Literal
-import keyboard
+
+from pynput import keyboard as kb
+from pynput.keyboard import Controller
 from pydantic import BaseModel
 
+_kb_controller = Controller()
+print("modules imported")
 
 class Note(BaseModel):
     name: str
@@ -49,19 +54,19 @@ KEYS = KeyMapConfig(
 # Speed regions: ``<x2> ... </x>`` — only wrapped notes use that factor.
 # Parallel voices in ``<p>``: separate with ``|`` (outside ``<x>…</x>``). Playback uses a merged time schedule:
 # each voice is simulated like serial (own ``speed_mul`` per step), events get absolute times, then sorted and played.
-with open("./sheets/canon.txt", "rt") as f:
+with open("sheets/sky-forest-bgm/guitar.txt", "rt") as f:
     text_sheet: str = f.read()
 
 # Total length of one beat (seconds), before speed scaling.
-single_beat_seconds = 0.35
+single_beat_seconds = 0.33
 
 # Release the physical key this many seconds *before* the beat ends (staccato gap).
 # Scaled by speed like the beat (shorter beats → proportionally shorter early release).
 # If the next step is a tie, the key stays down for the full beat (no early release).
 release_before_beat_end = 0.03
 
-# Hotkey to start the script (press once)
-START_HOTKEY = "alt+p"
+# Hotkey to toggle pause/resume (``GlobalHotKeys`` angle-bracket modifiers).
+START_HOTKEY_PYNPUT = "<ctrl>+1"
 
 
 def _is_tie_run(token: str, tie_char: str) -> bool:
@@ -105,7 +110,7 @@ def _keyboard_press_key(key: str) -> None:
     with _keyboard_lock:
         _key_press_refcount[key] = _key_press_refcount.get(key, 0) + 1
         if _key_press_refcount[key] == 1:
-            keyboard.press(key)
+            _kb_controller.press(key)
 
 
 def _keyboard_release_key(key: str) -> None:
@@ -116,13 +121,13 @@ def _keyboard_release_key(key: str) -> None:
         _key_press_refcount[key] = n - 1
         if _key_press_refcount[key] == 0:
             del _key_press_refcount[key]
-            keyboard.release(key)
+            _kb_controller.release(key)
 
 
 def release_all_keys() -> None:
     with _keyboard_lock:
         for k in list(_key_press_refcount.keys()):
-            keyboard.release(k)
+            _kb_controller.release(k)
         _key_press_refcount.clear()
 
 
@@ -515,13 +520,15 @@ def main() -> None:
         f"Beat: {single_beat_seconds}s (÷N inside <xN>…</x>); "
         f"release {release_before_beat_end}s before beat end (scaled)"
     )
-    print(f"Start hotkey: {START_HOTKEY}")
+    print(f"Start hotkey: {START_HOTKEY_PYNPUT}")
     print("Exit: Ctrl+C\n")
 
     # Note: On Windows, this may require running the script as Administrator.
-    keyboard.add_hotkey(START_HOTKEY, toggle_pause)
+    # macOS: grant Accessibility to the terminal/Python in System Settings.
+    hotkeys = kb.GlobalHotKeys({START_HOTKEY_PYNPUT: toggle_pause})
+    hotkeys.start()
 
-    # Start paused until the first Alt+S press.
+    # Start paused until the first start-hotkey press.
     pause_event.set()
 
     try:
@@ -609,7 +616,7 @@ def main() -> None:
     finally:
         release_current_if_any()
         release_all_keys()
-        keyboard.unhook_all_hotkeys()
+        hotkeys.stop()
         print("Stopped.")
 
 
